@@ -1,5 +1,8 @@
 // ******************************************************************************************
-// TITLE: 
+// TITLE:    ECAM02 Modbus Slave firmware
+// AUTHOR:   Neil Jansen (neil@tinwhiskers.io)
+// PLATFORM: Atmega328
+// 
 // https://github.com/TinWhiskers/fpd-design/wiki/ECAM02---End-Effector-PCB-w-USB-pass-through
 // ******************************************************************************************
 
@@ -12,8 +15,9 @@
 //     When querying the end effector, return the averaged reading instead of ther instantaneous one.
 // * Add thread to handle stepping in background.
 
-#include "EEPROM.h"
+#include <EEPROM.h>
 #include <Wire.h> // I2C
+#include <AccelStepper.h>
 #include <avr/eeprom.h>
 #include <Adafruit_MCP4725.h>
 #include <modbus.h>
@@ -36,17 +40,11 @@
 #define ENABLE   17  // DRV8825 enable
 #define DTR      4   // RS-485 transmit enable
 
-#define 
-
 // Useful macros
 #define CW       1   // For stepper motor
 #define CCW      0   // For stepper motor
 
 #define ANALOG_BITWEIGHT (5.0 / 1024.0)
-
-#define DRIVER_MICROSTEPS      32.0
-#define MOTOR_STEPS_PER_DEG    1.8
-#define STEP_PER_DEGREE 88.888
 
 
 // ******************************************************************************************
@@ -56,30 +54,27 @@ Adafruit_MCP4725 dac;
 
 // Global registers that can go across the MODBUS tubes
 //-------------------------------------------------------------------------------------------
-modbusRegister  *reg_vacsense;
+modbusDevice   regBank;                // Setup the brewtrollers register bank.  All of the data accumulated will be stored here
+modbusSlave    slave(DTR);             // Create the modbus slave protocol handler
+modbusRegister *reg_vacsense;          // Raw value from 10-bit ADC.
+modbusRegister *reg_thetaCount;        // 0=0 degrees.  32767 = 360 degrees.
+modbusRegister *reg_thetaEn;           // 0=off.  1=enable.
+modbusRegister *reg_thetaCurrent;      // The current position of the theta stepper motor.
+modbusRegister *reg_solenoid1;         // 0=off.  255=fully on.
+modbusRegister *reg_solenoid2;         // 0=off.  255=fully on.
+modbusRegister *reg_solenoid3;         // 0=off.  255=fully on.
+modbusRegister *reg_solenoid4;         // 0=off.  255=fully on.
+modbusRegister *reg_pump;              // 0=off.  255=fully on.
+modbusRegister *reg_ringlight;         // 0=off.  255=fully on.
 
+long thetaRawStepCurrent = 0; // Current raw step count for the stepper motor.
+long thetaRawStepDesired = 0; // Desired raw step count for the stepper motor.
+boolean thetaDirection = CW;
+boolean thetaEnabled = false;
 
-float   reg_vacsense  = 0;     // 0-5 volts, float
-float   reg_thetaAngle= 0;     // 0-360 degrees.  -1 to disable the motor.
-uint8_t reg_solenoid1 = 0;     // 0=off.  255=fully on.
-uint8_t reg_solenoid2 = 0;     // 0=off.  255=fully on.
-uint8_t reg_solenoid3 = 0;     // 0=off.  255=fully on.
-uint8_t reg_solenoid4 = 0;     // 0=off.  255=fully on.
-uint8_t reg_pump      = 0;     // 0=off.  255=fully on.
-uint8_t reg_ringlight = 0;     // 0=off.  255=fully on.
-//-------------------------------------------------------------------------------------------
-// MODBUS globals
-modbusDevice regBank; // Setup the brewtrollers register bank.  All of the data accumulated will be stored here
-modbusSlave slave;    // Create the modbus slave protocol handler
-//-------------------------------------------------------------------------------------------
-
-long rawStepCount = 0; // Raw step count for the stepper motor.
-
-// Fast I/O stuff for stepping at a moderately fast rate, without digitalWrite()
-uint8_t stepBitmask = digitalPinToBitMask(STEP);
-uint8_t stepPort    = digitalPinToPort(STEP);
-volatile uint8_t *stepOut;
-
+// Stepper motor
+// http://www.airspayce.com/mikem/arduino/AccelStepper/classAccelStepper.html
+AccelStepper stepper(AccelStepper::DRIVER, STEP, DIR, 99, 99);
 
 // ******************************************************************************************
 // SETUP
@@ -101,7 +96,15 @@ void setup()
   // Configure analog input
   analogReference(DEFAULT);
   analogRead(VACSENSE); //this should put it into analog mode
-  
+
+  //stepper.setEnablePin(ENABLE); // handle the enable pin outside of the library
+  stepper.setMaxSpeed(100);    // Steps per second
+  stepper.setSpeed(50);        // Steps per second
+  stepper.setAcceleration(20); // Steps per second
+
+  // stepBitmask = digitalPinToBitMask(STEP);
+  // stepPort    = digitalPinToPort(STEP);
+
   // For Adafruit MCP4725A1 the address is 0x62 (default) or 0x63 (ADDR pin tied to VCC)
   // For MCP4725A0 the address is 0x60 or 0x61
   // For MCP4725A2 the address is 0x64 or 0x65
@@ -111,6 +114,29 @@ void setup()
   regBank.setId(1); //Modbus set device ID
   slave._device = &regBank;
   slave.setBaud(9600);   
+
+  // 00001-09999  Digital Outputs, A master device can read and write to these registers
+  reg_thetaEn      = regBank.getRegister(00001);
+  
+  // 10001-19999  Digital Inputs, A master device can only read the values from these registers
+
+  // 30001-39999  Analog Inputs, A master device can only read the values from these registers
+  reg_vacsense     = regBank.getRegister(30001);  
+  reg_thetaCurrent = regBank.getRegister(30002);  
+  
+  // 40001-49799  Analog Outputs, A master device can read and write to these registers 
+  // 498512-49999  Analog Outputs, A master device can read and write to these registers 
+  reg_thetaCount   = regBank.getRegister(40001);  
+  reg_solenoid1    = regBank.getRegister(40003);  
+  reg_solenoid2    = regBank.getRegister(40004);  
+  reg_solenoid3    = regBank.getRegister(40005);  
+  reg_solenoid4    = regBank.getRegister(40006);  
+  reg_pump         = regBank.getRegister(40007);  
+  reg_ringlight    = regBank.getRegister(40008);  
+
+  // 49800-498511 EEPROM registers, 0-511 respectively
+  
+
 #else
   Serial.begin(9600);
   Serial.println("EndEffector Demo");
@@ -128,6 +154,20 @@ void loop()
 #ifdef MODBUS
   slave.run();
   //Update the end effector peripherals based off of the new values received from MODBUS.
+
+  //Read the vacuum sensor and update the register.
+  reg_vacsense    ->set((word)readVacuumSensor() );
+  reg_thetaCurrent->set((word)stepper.currentPosition() );
+
+  updateTheta(      reg_thetaCount->get() );
+  setCoil(    SOL1, reg_solenoid1 ->get() );
+  setCoil(    SOL2, reg_solenoid2 ->get() );
+  setCoil(    SOL3, reg_solenoid3 ->get() );
+  setCoil(    SOL4, reg_solenoid4 ->get() );
+  setCoil(    PUMP, reg_pump      ->get() );
+  setLedBrightness( reg_ringlight ->get() );
+  enableMotor( (boolean) reg_thetaEn   ->get() );
+
   
 #else
   // put your main code here, to run repeatedly:
@@ -136,72 +176,38 @@ void loop()
   delay(1000);
 #endif
 
+  stepper.run();  //Poll the motor and step it if a step is due
 }
 
 // ******************************************************************************************
 // VACUUM SENSOR
 // ******************************************************************************************
-float readVacuumSensor()
+int readVacuumSensor()
 {
-  int reading = analogRead(VACSENSE);
-  float scaled = reading * ANALOG_BITWEIGHT;
-  return scaled;
+  return analogRead(VACSENSE);
 }
+
+// ******************************************************************************************
+// PWM COILS / MOTORS
+// ******************************************************************************************
+void setCoil(uint8_t pin, uint8_t pwmValue)
+{
+  analogWrite(pin, pwmValue);
+}
+
 
 // ******************************************************************************************
 // STEPPER MOTOR
 // ******************************************************************************************
 
-void setMotorAngle(float angle)
+void updateTheta(int count)
 {
-  //todo: Implement this.
+  stepper.moveTo(count);
 }
 
-void pulseMotor(int steps)
+void enableMotor(boolean enabled)
 {
-  uint32_t numSteps;
-  boolean dir;
-  if (steps == 0)
-  {
-    return;
-  }
-  else if (steps < 0)
-  {
-    numSteps = -steps;
-    digitalWrite(DIR,
-  }
-  
-  for (int i=0;i<steps;i++)
-  {
-    pulsefast();
-  }
-}
-
-// Optimized routine to send a really fast pulse to the DRV8825.
-// It is hard-coded to use the STEP pin, since we've only got the one motor.
-void pulsefast()
-{
-    stepOut = portOutputRegister(stepPort);
-
-    uint8_t oldSREG = SREG;
-    cli();
-
-    *out |= stepBitmask;
-    STEPPER_PULSE_DELAY;
-    *out &= ~stepBitmask;
-    SREG = oldSREG;
-}
-
-void enableMotor(boolean enable)
-{
-  if (enable)
-  {
-    digitalWrite(ENABLE, LOW); //active low
-  }
-  else
-  {
-    digitalWrite(ENABLE, HIGH);
-  }
+  digitalWrite(ENABLE, !enabled);
 }
 
 // ******************************************************************************************
@@ -210,21 +216,17 @@ void enableMotor(boolean enable)
 
 void setLedBrightness(uint8_t brightness)
 {
+  if (brightness == 0)
+  {
+    digitalWrite(ENABLE, HIGH);
+  }
+  else
+  {
+    digitalWrite(ENABLE, LOW); //active low
+  }
   //Input is 0-255. Output is 16-bit DAC.  
   uint16_t dacvalue = brightness * (uint16_t) 16;
   //Configure DAC
   dac.setVoltage(dacvalue, false);
-}
-
-void enableRingLight(boolean enable) 
-{
-  if (enable)
-  {
-    digitalWrite(ENABLE, LOW); //active low
-  }
-  else
-  {
-    digitalWrite(ENABLE, HIGH);
-  }
 }
 
